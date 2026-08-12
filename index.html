@@ -561,7 +561,7 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.16a';
+const APP_VERSION='v4.6.16b';
 const SUPER_RATE=0.12; /* SG rate, 12% from 1 Jul 2025. One-line change if legislated rate moves. */
 /* v4.6.12a (26 Jul 2026): fleet-alignment rebuild - feature content identical to v4.6.12; new version string per one-build-one-version discipline. */
 /* v4.6.12 (20 Jul 2026): PER-CREW PIN, contractor-controlled (design settled with the founder before any deploy; an earlier worker-self-set draft was discarded - self-set has a bootstrap race where an imposter claims a name first and sets its PIN). MODEL: every worker is AUTO-ASSIGNED a random 4-digit PIN (genCrewPin at creation; existing crew backfilled via SQL per contractor at rollout). The PIN is stored READABLE at crew_members.data.pin and shown on the worker's card in My Database (admin-only surface) with a regenerate button and a 'Text PIN' button (plain GSM-7 SMS via /api/send-sms so the worker has it on file). DELIBERATE ENGINEERING CALL, not an oversight: with the shared anon key and a 4-digit space, a hash is brute-forced in under a second by anyone determined, so hashing here is theatre; readable storage buys contractor look-up-ability at no real security cost. This is a visibility gate against casual wrong-name claims - real authentication is v5 (Supabase Auth + RLS). CLAIM FLOW: picking a name with a PIN demands it (CrewPinVerifyModal, direct compare, works offline once the record is synced; names with PINs show a lock in the picker); 'Not you?' re-challenges; app_settings.requireCrewPin=true blocks claiming names with NO pin ('ask your contractor') for hard-lockdown contractors, off = pinless names bind as before. Workers never set or change their own PIN; contractor regenerates on request (specific chosen PINs = SRD via SQL). Lead/Admin PINs and the per-job PIN untouched. */
@@ -1734,7 +1734,10 @@ function calcProg(job){
 function fmtDays(worked,allocated){
   const a=Number(allocated)||0;
   if(!a)return 'Day '+worked;
-  if(worked>a)return 'Day '+worked+' \u2014 '+(worked-a)+' over plan';
+  /* v4.6.16b - sheds run over for reasons outside the crew's control (rain, wet
+     sheep, power out). 'N over plan' read as a criticism of the gang. The overrun
+     day still counts and still shows; only the scolding is gone. */
+  if(worked>a)return 'Day '+worked+' of '+a;
   return 'Day '+worked+' of '+a;
 }
 function fmtSplit(sh,cr){
@@ -3039,8 +3042,13 @@ function TopBar({role,setRole,onBack,backLabel,onSchedule}){
 }
 /* ── WEEK BANNER ── */
 function WeekBanner({jobs,contractorName}){
-  const active=jobs.filter(j=>j.status==='Active');
-  const crew=new Set(jobs.filter(j=>j.status==='Active'||j.status==='Dispatched').flatMap(j=>j.crew)).size;
+  /* v4.6.16b - a job that starts next week is not running today. Header counts use
+     the same start-date gate as the Home list, or the banner says 9 while the list
+     shows 4. 'Crew Out' especially: nobody is out yet on a shed starting Tuesday. */
+  const _wbToday=localToday();
+  const _wbStarted=j=>!j.startDate||j.startDate<=_wbToday;
+  const active=jobs.filter(j=>j.status==='Active'&&_wbStarted(j));
+  const crew=new Set(jobs.filter(j=>(j.status==='Active'||j.status==='Dispatched')&&_wbStarted(j)).flatMap(j=>j.crew)).size;
   const progs=active.map(j=>calcProg(j));
   const shorn=progs.reduce((s,p)=>s+p.shorn,0);
   const bSh=progs.reduce((s,p)=>s+p.sh,0),bCr=progs.reduce((s,p)=>s+p.cr,0);
@@ -3062,6 +3070,10 @@ function JLC({job,onClick,wb}){
     isDraft&&e('div',{className:'draft-hint'},'◌ Draft — not sent to crew yet. Tap to open and publish.'),
     !isDraft&&job.status==='Active'&&p.daysWorked>0&&e('div',null,e('div',{className:'jlc-pr'},e('span',null,fmtSplit(p.sh,p.cr)+' \u2014 '+fmtDays(p.daysWorked,job.daysAllocated)),e('span',{className:'pct-lbl'},Math.round(p.pct)+'%')),e('div',{className:'pbar'},e('div',{className:`pbar-f ${cls}`,style:{width:p.pct+'%'}}))),
     job.status==='Dispatched'&&e('div',{style:{fontSize:'12px',color:'var(--amber)',marginTop:'6px'}},'📱 Dispatched — starts '+fmtDateLong(job.startDate)),
+    /* v4.6.16b - an Active job that has not started yet must say so. Gated off the main
+       Home list, so this renders in search results, Schedule and the crew board -
+       exactly the places a future shed is legitimately visible. */
+    job.status==='Active'&&job.startDate&&job.startDate>localToday()&&e('div',{style:{fontSize:'12px',color:'var(--amber)',marginTop:'6px',fontWeight:600}},'📅 Starts '+fmtDateLong(job.startDate)),
     job.status==='Completed'&&e('div',{style:{fontSize:'12px',color:'var(--blue)',marginTop:'6px'}},'\u2713 '+fmtSplit(p.sh,p.cr))
   );
 }
@@ -5653,7 +5665,22 @@ function HomeScreen({jobs:allJobs,role,setRole,onJob,onNew,onDatabase,onSchedule
   const matches=j=>!q||jobName(j).toLowerCase().includes(q)||j.type.toLowerCase().includes(q);
 
   const drafts=jobs.filter(j=>j.status==='Draft'&&matches(j));
-  const active=jobs.filter(j=>j.status==='Active'&&matches(j)).sort(sortFn);
+  /* v4.6.16b - START-DATE GATE. Published jobs appear on the board the morning they
+     start, not the moment they are created. At 5-10 jobs lined up, future sheds
+     were indistinguishable from sheds actually running (the card prints no date for
+     an Active job, and calcProg suppresses the progress bar at daysWorked 0).
+     START ONLY, never an end gate: an Active job stays on the board until it is
+     cycled to Completed, so a shed that runs two days over cannot vanish mid-job.
+     Missing/blank startDate counts as started - legacy or bad-data jobs can never
+     disappear off the board. Search escapes the gate (see below). */
+  const _homeToday=localToday();
+  const jobStarted=j=>!j.startDate||j.startDate<=_homeToday;
+  const _activeAll=jobs.filter(j=>j.status==='Active'&&matches(j)).sort(sortFn);
+  /* Searching drops the gate: hunting a job you know exists and getting nothing back
+     is worse than the clutter the gate removes. */
+  const active=q?_activeAll:_activeAll.filter(jobStarted);
+  const upcoming=_activeAll.filter(j=>!jobStarted(j))
+    .sort((a,b)=>String(a.startDate||'').localeCompare(String(b.startDate||'')));
   const completed=jobs.filter(j=>j.status==='Completed'&&matches(j)).sort(sortFn);
   const charged=jobs.filter(j=>j.status==='Charged Out'&&matches(j)).sort(sortFn);
   const isEmpty=jobs.length===0;
@@ -5780,6 +5807,19 @@ function HomeScreen({jobs:allJobs,role,setRole,onJob,onNew,onDatabase,onSchedule
           e('div',{className:'drafts-pill-s'},'Tap to open Schedule and publish')
         ),
         e('div',{className:'drafts-pill-arr'},'›')
+      ),
+
+      /* v4.6.16b - upcoming jobs are gated off the list but must not go silent, or a shed
+         set up three weeks out is forgotten and the crew never get an SMS. One row,
+         not a second list - it stays one row at 10 lined up. Hidden while searching,
+         because search already shows those jobs in the list above. */
+      upcoming.length>0&&!q&&onSchedule&&e('div',{className:'drafts-pill',style:{borderColor:'var(--amber)'},onClick:onSchedule},
+        e('div',{className:'drafts-pill-ic',style:{color:'var(--amber)'}},'📅'),
+        e('div',{className:'drafts-pill-body'},
+          e('div',{className:'drafts-pill-t'},upcoming.length+' job'+(upcoming.length>1?'s':'')+' coming up'),
+          e('div',{className:'drafts-pill-s'},'Next: '+(function(){const n=upcoming[0];const f=gf(n.farmId);return (n.jobName||(f?f.name:'Unnamed'))+' — '+fmtDateLong(n.startDate);})())
+        ),
+        e('div',{className:'drafts-pill-arr',style:{color:'var(--amber)'}},'›')
       ),
 
       isEmpty&&e('div',{style:{margin:'32px 16px 0',padding:'32px 24px',background:'var(--card)',border:'2px dashed var(--border)',borderRadius:'var(--r)',textAlign:'center'}},
